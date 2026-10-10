@@ -1,0 +1,30 @@
+[project]
+name = "artifactory-mocks-mcp"
+version = "0.1.0"
+description = "MCP server that finds WireMock provider mocks in JFrog Artifactory for an API endpoint"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0,<2",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+artifactory-mocks-mcp = "artifactory_mocks_mcp.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/artifactory_mocks_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

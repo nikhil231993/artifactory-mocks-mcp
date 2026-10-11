@@ -12,6 +12,7 @@ from typing import Any
 
 from .client import ArtifactoryClient, ArtifactoryError, ArtifactoryNotFound
 from .config import Settings
+from .kafka import KafkaEvent
 from .versions import (
     Build,
     build_from_listing,
@@ -31,6 +32,7 @@ from .wiremock import (
 )
 
 MAX_CACHED_ARCHIVES = 256
+MAX_LISTED_TOPICS = 30
 
 
 class NoSnapshotError(ArtifactoryError):
@@ -51,6 +53,14 @@ def _limit(text: str, max_chars: int) -> tuple[Any, bool]:
         return json.loads(text), False
     except ValueError:
         return text, False  # e.g. a {{template}} outside a JSON string
+
+
+def _limit_json(value: Any, max_chars: int) -> tuple[Any, bool]:
+    """(value, truncated): the value as is, or its JSON text cut to max_chars."""
+    dumped = json.dumps(value)
+    if len(dumped) <= max_chars:
+        return value, False
+    return dumped[:max_chars], True
 
 
 class MockService:
@@ -227,9 +237,8 @@ class MockService:
         max_chars = self.settings.max_body_chars
         text: str | None = None
         if "jsonBody" in resp:
-            dumped = json.dumps(resp["jsonBody"])
-            body, truncated = (resp["jsonBody"], False) if len(dumped) <= max_chars else _limit(dumped, max_chars)
-            text = dumped
+            text = json.dumps(resp["jsonBody"])
+            body, truncated = _limit_json(resp["jsonBody"], max_chars)
         elif "body" in resp:
             text = str(resp["body"])
             body, truncated = _limit(text, max_chars)
@@ -252,17 +261,71 @@ class MockService:
             out["body_chars"] = len(text)
         return out
 
+    def kafka_entry(self, event: KafkaEvent) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "topic_folder": event.folder or None,
+            "file": event.file,
+            "envelope_file": event.envelope_file,
+            "event_type": event.event_type,
+            "customer_type": event.customer_type,
+        }
+        for label, part in (("key", event.key), ("value", event.value)):
+            if part is None:
+                continue
+            value, truncated = _limit_json(part.value, self.settings.max_body_chars)
+            out = {"format": part.format, "schema_file": part.schema_file, "value": value}
+            if truncated:
+                out["value_truncated"] = True
+            entry[label] = {k: v for k, v in out.items() if v is not None}
+        return {k: v for k, v in entry.items() if v is not None}
+
+    def kafka_topics(self, archive: MockArchive) -> list[dict[str, Any]]:
+        """A zip's Kafka topics: each topic folder's events and schema files."""
+        topics: dict[str, dict[str, Any]] = {}
+        for event in archive.kafka_events:
+            topic = topics.setdefault(event.folder, {"topic_folder": event.folder or None, "events": []})
+            info = {"file": event.file, "event_type": event.event_type, "customer_type": event.customer_type}
+            topic["events"].append({k: v for k, v in info.items() if v is not None})
+        for folder, topic in topics.items():
+            directory = posixpath.join("kafka", folder) if folder else "kafka"
+            topic["schemas"] = sorted(
+                n for n in archive.files if posixpath.dirname(n) == directory and n.endswith(".avsc")
+            )
+        return [{k: v for k, v in t.items() if v is not None} for t in topics.values()]
+
+    def kafka_schemas(
+        self, component: str, archive: MockArchive, events: list[KafkaEvent], notes: list[str]
+    ) -> dict[str, Any]:
+        """The Avro schemas the events name, by path in the zip."""
+        schemas: dict[str, Any] = {}
+        files = sorted({p.schema_file for e in events for p in (e.key, e.value) if p and p.schema_file})
+        for path in files:
+            data = archive.files.get(path)
+            if data is None:
+                notes.append(f"{component}: schema {path} is not in the zip")
+                continue
+            text = data.decode("utf-8", errors="replace")
+            schemas[path], _ = _limit(text, self.settings.max_body_chars)
+        return schemas
+
     # ---- tool entry points ----------------------------------------------------------
+
+    async def _load(self, component: str) -> tuple[Choice, MockArchive] | str:
+        """The component's chosen build and zip, or why it was skipped."""
+        try:
+            choice = await self.choose(component)
+            return choice, await self.archive(component, choice.build)
+        except ArtifactoryError as exc:
+            message = str(exc)
+            return message if message.startswith(component) else f"{component}: {message}"
 
     async def _search(
         self, component: str, path: str, method: str | None
     ) -> tuple[Choice, MockArchive, list[StubMatch]] | str:
-        try:
-            choice = await self.choose(component)
-            archive = await self.archive(component, choice.build)
-        except ArtifactoryError as exc:
-            message = str(exc)
-            return message if message.startswith(component) else f"{component}: {message}"
+        loaded = await self._load(component)
+        if isinstance(loaded, str):
+            return loaded
+        choice, archive = loaded
         return choice, archive, match_stubs(archive.stubs, path, method)
 
     async def find(
@@ -334,6 +397,84 @@ class MockService:
             result["notes"] = notes
         return result
 
+    async def find_kafka(
+        self,
+        topic: str,
+        event_type: str | None = None,
+        system: str | None = None,
+        component: str | None = None,
+        include_schemas: bool = False,
+        max_events: int = 20,
+    ) -> dict[str, Any]:
+        components = [component] if component else await self.components(system)
+        notes: list[str] = []
+        if not components:
+            notes.append(
+                f"No component folder under {self._path()} matches {', '.join(self.patterns(system))}."
+            )
+
+        outcomes = await asyncio.gather(*(self._load(c) for c in components))
+        found: list[tuple[str, MockArchive, KafkaEvent]] = []
+        artifacts: dict[str, Any] = {}
+        topics_seen: set[str] = set()
+        on_topic: list[KafkaEvent] = []
+        for name, outcome in zip(components, outcomes):
+            if isinstance(outcome, str):
+                notes.append(outcome)
+                continue
+            choice, archive = outcome
+            if archive.kafka_errors:
+                notes.append(f"{name}: could not parse {'; '.join(archive.kafka_errors)}")
+            topics_seen.update(e.folder for e in archive.kafka_events if e.folder)
+            events = [e for e in archive.kafka_events if e.matches_topic(topic)]
+            on_topic += events
+            matched = [e for e in events if not event_type or e.matches_event(event_type)]
+            if matched:
+                artifacts[name] = self.artifact_info(name, choice, archive)
+                found += [(name, archive, e) for e in matched]
+
+        shown = found[:max_events]
+        if len(found) > len(shown):
+            notes.append(f"Showing {len(shown)} of {len(found)} events. Raise max_events, or pass event_type.")
+        if not on_topic and components:
+            listed = sorted(topics_seen)
+            notes.append(
+                f"No Kafka mock for topic '{topic}'. "
+                + (
+                    f"Topic folders found: {', '.join(listed[:MAX_LISTED_TOPICS])}"
+                    + (" ..." if len(listed) > MAX_LISTED_TOPICS else "")
+                    if listed
+                    else "None of the searched components has a kafka/ folder."
+                )
+            )
+        elif not found and event_type:
+            kinds = sorted({f"{e.event_type or '-'} ({e.name})" for e in on_topic})
+            notes.append(f"No '{event_type}' event on this topic. Its events: {', '.join(kinds)}")
+        elif len(found) > 1 and not event_type:
+            notes.append(
+                "Several events on this topic. They differ in event_type and customer_type: "
+                "pass event_type to get one."
+            )
+
+        result: dict[str, Any] = {
+            "query": {"topic": topic, "event_type": event_type, "system": system, "component": component},
+            "components_searched": len(components),
+            "total_matches": len(found),
+            "artifacts": artifacts,
+            "events": [{"component": name, **self.kafka_entry(e)} for name, _, e in shown],
+        }
+        if include_schemas and shown:
+            by_component: dict[str, tuple[MockArchive, list[KafkaEvent]]] = {}
+            for name, archive, event in shown:
+                by_component.setdefault(name, (archive, []))[1].append(event)
+            result["schemas"] = {
+                name: self.kafka_schemas(name, archive, events, notes)
+                for name, (archive, events) in by_component.items()
+            }
+        if notes:
+            result["notes"] = notes
+        return result
+
     async def list_components(self, system: str | None = None, with_builds: bool = False) -> dict[str, Any]:
         children = [name for name, folder in await self._children() if folder]
         names = [system.strip().lower()] if system else sorted(self.settings.systems)
@@ -387,8 +528,11 @@ class MockService:
             notes.append(f"Showing {len(shown)} of {len(archive.stubs)} stubs; raise max_stubs.")
         if archive.errors:
             notes.append(f"Could not parse: {'; '.join(archive.errors)}")
-        if archive.has_kafka():
-            notes.append("The zip also has kafka/ mocks, which these tools don't read yet.")
+        if archive.kafka_events:
+            result["kafka_topics"] = self.kafka_topics(archive)
+            notes.append("The zip also has Kafka message mocks: get them with find_kafka_mock.")
+        if archive.kafka_errors:
+            notes.append(f"Could not parse: {'; '.join(archive.kafka_errors)}")
         if notes:
             result["notes"] = notes
         return result

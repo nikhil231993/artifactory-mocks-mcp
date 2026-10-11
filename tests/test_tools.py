@@ -116,7 +116,17 @@ async def test_get_mock_stubs_default_and_pinned_versions(service):
     result = await server.get_mock_stubs("cm-addresses")
     assert result["total_stubs"] == 4
     assert result["artifact"]["version"] == "1.2.0-SNAPSHOT"
-    assert "kafka/" in " ".join(result["notes"])
+    assert "find_kafka_mock" in " ".join(result["notes"])
+    topics = {t["topic_folder"]: t for t in result["kafka_topics"]}
+    assert [e["event_type"] for e in topics["customer_addresses-event-v1"]["events"]] == [
+        "DeleteAddress",
+        "UpdateAddress",
+    ]
+    assert topics["customer_addresses-event-v1"]["schemas"] == [
+        "kafka/customer_addresses-event-v1/keySchema.avsc",
+        "kafka/customer_addresses-event-v1/valueSchema.avsc",
+    ]
+    assert topics["customer_status-event-v1"]["schemas"] == []
     assert "body" not in result["stubs"][0]["response"]
 
     result = await server.get_mock_stubs("cm-addresses", version="1.3.1-SNAPSHOT", include_bodies=True)
@@ -145,3 +155,75 @@ async def test_get_mock_file(service):
 
     with pytest.raises(ValueError, match="Files: "):
         await server.get_mock_file("cm-addresses", "nope.json")
+
+
+async def test_find_kafka_mock_returns_every_event_on_the_topic(service):
+    result = await server.find_kafka_mock("customer.addresses-event-v1", system="customer-master")
+
+    assert result["total_matches"] == 2
+    assert result["artifacts"]["cm-addresses"]["build"] == "1.2.0-20260819.052644-19"
+    delete, update = result["events"]
+    assert delete == {
+        "component": "cm-addresses",
+        "topic_folder": "customer_addresses-event-v1",
+        "file": "kafka/customer_addresses-event-v1/address_delete_event.json",
+        "envelope_file": "kafka/customer_addresses-event-v1/address_delete_event_envelope.json",
+        "event_type": "DeleteAddress",
+        "customer_type": "IND",
+        "key": {
+            "format": "avro",
+            "schema_file": "kafka/customer_addresses-event-v1/keySchema.avsc",
+            "value": {"cgid": "C1000001"},
+        },
+        "value": {
+            "format": "avro",
+            "schema_file": "kafka/customer_addresses-event-v1/valueSchema.avsc",
+            "value": delete["value"]["value"],
+        },
+    }
+    assert delete["value"]["value"]["subject"] is None
+    assert delete["value"]["value"]["previousSubject"]["addressId"] == "A1"
+    assert update["customer_type"] == "ORG"
+    assert "schemas" not in result
+    assert any("Several events on this topic" in n for n in result["notes"])
+
+
+async def test_find_kafka_mock_by_event_type_with_schemas(service):
+    # The folder form of the topic, and the event's file name instead of its metadata.type.
+    result = await server.find_kafka_mock(
+        "customer_addresses-event-v1", event_type="address_update_event_org", include_schemas=True
+    )
+    [event] = result["events"]
+    assert event["event_type"] == "UpdateAddress"
+    schemas = result["schemas"]["cm-addresses"]
+    assert schemas["kafka/customer_addresses-event-v1/keySchema.avsc"]["name"] == "CustomerKey"
+    assert schemas["kafka/customer_addresses-event-v1/valueSchema.avsc"]["name"] == "AddressStateChangeEvent"
+
+    # A string key with no schema.
+    result = await server.find_kafka_mock("customer.status-event-v1", include_schemas=True)
+    [event] = result["events"]
+    assert event["key"] == {"format": "string", "value": "C1000001"}
+    assert result["schemas"] == {"cm-addresses": {}}
+
+
+async def test_find_kafka_mock_explains_what_exists_when_nothing_matches(service):
+    result = await server.find_kafka_mock("customer.unknown-v1", system="customer-master")
+    assert result["total_matches"] == 0
+    notes = " ".join(result["notes"])
+    assert "Topic folders found: customer_addresses-event-v1, customer_status-event-v1" in notes
+    assert "cm-warnings: skipped" in notes
+
+    result = await server.find_kafka_mock("customer.addresses-event-v1", event_type="CreateAddress")
+    assert result["total_matches"] == 0
+    assert "Its events: DeleteAddress (address_delete_event), UpdateAddress (address_update_event_org)" in " ".join(
+        result["notes"]
+    )
+
+
+async def test_find_kafka_mock_limits_and_truncates(make_service):
+    make_service(max_body_chars=50)
+    result = await server.find_kafka_mock("customer.addresses-event-v1", component="cm-addresses", max_events=1)
+    [event] = result["events"]
+    assert event["value"]["value_truncated"] is True and len(event["value"]["value"]) == 50
+    assert "value_truncated" not in event["key"]
+    assert "Showing 1 of 2 events" in " ".join(result["notes"])

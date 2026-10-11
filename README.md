@@ -1,19 +1,21 @@
 # artifactory-mocks-mcp
 
 An MCP server that finds **provider mocks** in **JFrog Artifactory**: given an API endpoint, it
-returns the WireMock stubs that mock it, with their responses.
+returns the WireMock stubs that mock it, with their responses; given a Kafka topic, it returns
+the mocked messages for that topic.
 
 A provider mock is a fake version of an API: "when you call `GET /v1/customers/{id}`, answer
 with this JSON". Teams publish them as zips to Artifactory so that callers can test without the
 real service. This server lets an agent (or any MCP client) look them up by endpoint, for
 example for each API that a dependency graph's `downstream_apis` reports.
 
-It has 4 tools:
+It has 5 tools:
 
-- **`find_mock`**: the main one. Endpoint in, matching stubs and response bodies out.
+- **`find_mock`**: the main one for REST. Endpoint in, matching stubs and response bodies out.
+- **`find_kafka_mock`**: the same for Kafka. Topic in, mocked messages (key and value) out.
 - **`list_mock_components`**: which mock components exist for each system, and which build
   each would use.
-- **`get_mock_stubs`**: every stub in one component.
+- **`get_mock_stubs`**: every stub in one component, and its Kafka topics.
 - **`get_mock_file`**: one file from a component's zip.
 
 It reads Artifactory over its REST API, anonymously or with a token. It only reads.
@@ -39,7 +41,8 @@ e.g.  mocks-repo/com/example/mocks/cm-addresses/1.2.0-SNAPSHOT/cm-addresses-1.2.
   mock.properties        org=<team>, url=<git repo the mocks were built from>
   mappings/**/*.json     the stubs: {"mappings": [ {request, response}, ... ]}
   __files/**             response bodies, referenced by a stub's response.bodyFileName
-  kafka/                 Kafka message mocks (not read yet)
+  kafka/<topic>/         Kafka message mocks, one folder per topic (see below)
+  README.md              notes from the mock's team (not read by the tools)
   ```
 - **A stub** looks like this:
   ```json
@@ -49,6 +52,28 @@ e.g.  mocks-repo/com/example/mocks/cm-addresses/1.2.0-SNAPSHOT/cm-addresses-1.2.
    "response": {"status": 200, "bodyFileName": "SOR/Addresses/patchResponse.json",
                 "transformers": ["response-template"]}}
   ```
+- **Kafka mocks** are in `kafka/`, one folder per topic. The folder is the topic name with
+  `.` written as `_`: topic `customer.addresses-event-v1` is folder `customer_addresses-event-v1`.
+  ```
+  kafka/customer_addresses-event-v1/
+    address_delete_event.json              the full Kafka record: key + value
+    address_delete_event_envelope.json     the value on its own (same as value.value above)
+    address_update_event_org.json          the same kind of file for another event; _org = ORG customer
+    address_update_event_org_envelope.json
+    keySchema.avsc                         Avro schema of the key
+    valueSchema.avsc                       Avro schema of the value
+  ```
+  A record file looks like this:
+  ```json
+  {"key":   {"type": "avro", "schema": {"file": "keySchema.avsc"},   "value": {"cgid": "C1000001"}},
+   "value": {"type": "avro", "schema": {"file": "valueSchema.avsc"},
+             "value": {"metadata": {"type": "DeleteAddress", "customerType": "IND",
+                                    "subject": "customer.addresses-event-v1", ...},
+                       "subject": null,
+                       "previousSubject": {...the address before the change...}}}}
+  ```
+  In the value, `metadata.type` names the event, `subject` is the record after the change and
+  `previousSubject` the record before it (so a delete has `subject: null`).
 
 ## Tools
 
@@ -85,6 +110,32 @@ one that fits the request it will send.
 **Response bodies are returned as stored.** Stubs with `"transformers": ["response-template"]`
 contain placeholders such as `{{request.path.cgid}}`, which WireMock fills in at run time.
 
+### `find_kafka_mock`
+
+Finds the mocked Kafka messages for a topic.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `topic` | required | The topic, e.g. `customer.addresses-event-v1`. The folder form `customer_addresses-event-v1` also works. Case doesn't matter. |
+| `event_type` | none | Only this event: its `metadata.type` (`DeleteAddress`) or its file name (`address_delete_event`). Without it, every event on the topic is returned. |
+| `system`, `component` | all systems | As in `find_mock` |
+| `include_schemas` | `false` | Also return the `.avsc` schemas the events name |
+| `max_events` | `20` | The most events to return (1–100) |
+
+It returns:
+- `events`: one per record file. Each has `component`, `topic_folder`, `file`,
+  `envelope_file`, `event_type`, `customer_type`, and `key` and `value`, each with its
+  `format` (e.g. `avro`), `schema_file` and the `value` itself.
+- `artifacts`: the build used for each component, as in `find_mock`.
+- `schemas` (with `include_schemas`): `{component: {schema path: schema}}`.
+- `notes`: when nothing matches, the topic folders or the event types that do exist.
+
+A topic usually has several events (delete, update, IND and ORG customers...). Like several
+stubs for one REST path, they are all returned, so the caller can pick the one it needs or
+pass `event_type`.
+
+A topic is found by its folder name, or by the `metadata.subject` inside its messages.
+
 ### `list_mock_components`
 
 | Parameter | Default | Meaning |
@@ -101,9 +152,13 @@ contain placeholders such as `{{request.path.cgid}}`, which WireMock fills in at
 | `include_bodies` | `false` | Add response bodies |
 | `max_stubs` | `200` | The most stubs to return |
 
+If the zip has Kafka mocks, `kafka_topics` lists each topic folder with its events
+(`file`, `event_type`, `customer_type`) and schema files.
+
 ### `get_mock_file`
 
-Reads one file from a component's zip: a mapping file, `mock.properties`, or a response body.
+Reads one file from a component's zip: a mapping file, `mock.properties`, a response body, or
+any other file, such as a Kafka record, an `.avsc` schema or the zip's `README.md`.
 A stub's `bodyFileName` works as it is (`SOR/Addresses/x.json` means `__files/SOR/Addresses/x.json`).
 `component` and `version` work as in `get_mock_stubs`.
 
@@ -130,6 +185,9 @@ A stub's `bodyFileName` works as it is (`SOR/Addresses/x.json` means `__files/SO
    suffix 500, any-url 100, plus 10 per matching fixed segment, plus 50 for an explicit
    (non-`ANY`) method match.
 5. **Return** the best `max_stubs` stubs across all components.
+
+`find_kafka_mock` does steps 1 to 3 the same way, then returns the `kafka/` records whose
+folder (or `metadata.subject`) is the topic, and whose event type is `event_type` if given.
 
 ## Architecture decisions
 
@@ -267,7 +325,7 @@ every request and the status Artifactory returned.
 ```
 
 Settings come from this project's `.env`. In **Cursor Settings → MCP** (**Tools & MCP** in newer
-versions), `artifactory-mocks` should show a green dot and 4 tools. Use the chat in **Agent**
+versions), `artifactory-mocks` should show a green dot and 5 tools. Use the chat in **Agent**
 mode. After changing `.env` or the code, turn the server off and on there.
 
 ### Claude Code
@@ -310,6 +368,8 @@ npx -y @modelcontextprotocol/inspector --cli /absolute/path/to/artifactory-mocks
 ```
 
 It should pick `cm-addresses` build `1.2.0-20260819.052644-19`, not the June `1.3.1` build.
+For Kafka, use `--tool-name find_kafka_mock --tool-arg topic=customer.addresses-event-v1`: it
+should return a `DeleteAddress` and an `UpdateAddress` event.
 The trial folder keeps its own `.env`, so it doesn't disturb your real one.
 
 ## First test against the real Artifactory
@@ -328,6 +388,10 @@ m --method tools/call --tool-name get_mock_stubs --tool-arg component=cm-address
 # c. A real endpoint from downstream_apis
 m --method tools/call --tool-name find_mock --tool-arg 'path=/v1/customers/customer-core/{id}' \
   --tool-arg method=GET --tool-arg system=customer-master 2>/dev/null
+
+# d. A Kafka topic: use a topic_folder from b's kafka_topics
+m --method tools/call --tool-name find_kafka_mock --tool-arg 'topic=<topic folder>' \
+  --tool-arg system=customer-master 2>/dev/null
 ```
 
 | Check | Good | If not |
@@ -336,6 +400,8 @@ m --method tools/call --tool-name find_mock --tool-arg 'path=/v1/customers/custo
 | a | The builds look current | Compare with the Artifactory UI. If a stale snapshot line wins, see decision 1 and pin `version`. |
 | b | `total_stubs` > 0 | Check `notes` for files that failed to parse |
 | c | The expected component and stub | Read `notes`. Try without `method`, or with `component`. List that component's stubs with b and compare the paths. |
+| b | `kafka_topics` lists the zip's topic folders and their events | Events without `event_type`, or parse errors in `notes`: the zip's Kafka files have another shape. Read one with `get_mock_file` and see the Kafka questions in [Open questions](#open-questions-and-later-work). |
+| d | Each event has a `key` and a `value` | As for b |
 
 ## Using it with a dependency graph
 
@@ -344,6 +410,8 @@ downstream_apis(service)   →  systems[]: {name: "customer-master",
                                           endpoints: [{method: "GET", path: "/v1/customers/customer-core/{id}"}]}
 for each endpoint:
   find_mock(path, method, system=<system name>)  →  stubs and responses
+for each Kafka topic:
+  find_kafka_mock(topic, system=<system name>)  →  mocked messages
 ```
 
 An instruction you can give an agent:
@@ -351,12 +419,73 @@ An instruction you can give an agent:
 > For each endpoint returned by downstream_apis, call find_mock with its path, its method, and
 > the system name. Report the component, the build, and each matching stub's request
 > conditions and response status. If notes mention skipped components or several stubs for one
-> path, show them.
+> path, show them. For each Kafka topic, call find_kafka_mock with the topic and the system
+> name, and report each event's event_type, customer_type and key.
 
 The same endpoint can be looked up in `ghes-openapi-mcp` with `find_openapi_spec` to get its
 OpenAPI spec; the two use the same path-matching rules.
 
+## Status and next steps
+
+Where the work stands, so it can be picked up on another machine or by another agent.
+
+**Done and tested** (62 tests, against the fake Artifactory in `devtools/` only):
+- the 4 REST tools, and the build choice (decision 1);
+- `find_kafka_mock`, and Kafka topics in `get_mock_stubs`.
+
+**Not yet tried against the real Artifactory.** The REST layout and the Kafka layout were
+taken from screenshots of one real component (`cm-addresses`): its folders, one mapping file,
+one Kafka record and its envelope, and its two `.avsc` schemas. The fake data copies that
+layout with made-up names and values.
+
+**Next, in this order:**
+1. On the company network, fill in `.env` and run [First test against the real
+   Artifactory](#first-test-against-the-real-artifactory), checks a to d. Fix whatever differs
+   from the fake data, and add that case to `devtools/fake_artifactory.py` with a test.
+2. Get answers to [How the server will be used](#how-the-server-will-be-used-to-agree-with-the-project-lead).
+   They decide whether to add a download command for consumers' tests.
+3. Work through the [Kafka](#kafka) questions, using `get_mock_file` to read the zip's
+   `README.md` and a few other topic folders.
+4. Then the smaller items under [Other](#other).
+
 ## Open questions and later work
+
+### How the server will be used (to agree with the project lead)
+
+The goal is that consumers get provider mocks from Artifactory, where the provider publishes
+them, instead of keeping a copy of them in the consumer's own repository. How consumers will
+ask for them isn't decided yet, and it changes what to build next:
+
+1. **Who calls it?** An AI agent (for example one that reads the dependency graph), the
+   consumer's tests or build, or a person?
+2. **What replaces the consumer's local copy?**
+   - An agent looking mocks up and reporting them: the MCP tools do this today.
+   - The consumer's tests running WireMock (or a Kafka mock) on the provider's files: they need
+     the files themselves, in a folder. That needs a download command on top of the same code,
+     e.g. `artifactory-mocks fetch --system customer-master --out src/test/resources/mocks`.
+   - Possibly both.
+3. **Is "dependency graph → agent → these tools" the plan, or one idea among others?**
+4. **Which version should consumers get?** The most recently built snapshot (today's choice,
+   decision 1), or a version they pin, so that a provider's change can't break their tests
+   without warning?
+
+### Kafka
+
+`find_kafka_mock` follows the layout seen in one real component (see
+[How the mocks are stored](#how-the-mocks-are-stored)). To confirm:
+
+1. **Topic names from the dependency graph.** It's expected to report Kafka dependencies by
+   topic name. Check the exact form (`customer.addresses-event-v1`?) against the folder names.
+2. **Does every `kafka/` folder look the same?** Check a few other topic folders and
+   components: the record shape (`key`/`value` with `type`, `schema.file`, `value`), a string
+   key instead of Avro, Kafka headers, other file names.
+3. **What does the zip's `README.md` say?** It may describe the format and how the files are
+   meant to be used.
+4. **Produced or consumed?** A component's zip holds topics like the one for its own events,
+   but also others. Does the component publish all of them, or consume some? If both, results
+   should say which.
+5. **Is `<event>_envelope.json` always the same as the record's `value.value`?** The tools
+   return the record and only name the envelope file.
 
 **TLM mocks (later).** They follow different conventions:
 - folders named `mock-tlm`, `mock-tlm-avp`;
@@ -373,11 +502,16 @@ To add them:
 Until then, `get_mock_stubs` and `get_mock_file` work for a TLM component when given an
 explicit `version`, e.g. `version=1.0.1`.
 
-**Kafka mocks (later).** Zips may have a `kafka/` folder. It's reported in `get_mock_stubs`
-notes but not read. Its format needs looking at first.
+### Other
 
-**Data.** Confirm with the mock owners that the mock responses are synthetic test data
-(decision 3).
+**Data.** Confirm with the mock owners that the mock responses and Kafka messages are
+synthetic test data (decision 3).
+
+**REST: pick the stub for a concrete request.** When a path has several stubs (e.g. 200 for
+most IDs, 400 for an `addressId` ending in `-400`, 422 for one ending in `-422`), `find_mock`
+returns them all with their conditions. When the caller gives a concrete path, it could also
+check `pathParameters` and `priority` the way WireMock does, and mark the stub that would
+answer.
 
 ## Known limitations
 
@@ -388,8 +522,10 @@ notes but not read. Its format needs looking at first.
   `123`, `ABC123`, a UUID and a few others. A regex that accepts none of them (e.g. exactly
   9 digits) won't match a templated path; pass a concrete path instead.
 - **Query strings aren't matched.** `url` and `urlPattern` stubs are compared on their path.
-- **Each `find_mock` call without `component` reads every component of the system** the
-  first time. Later calls use the cache.
+- **Each `find_mock` or `find_kafka_mock` call without `component` reads every component of
+  the system** the first time. Later calls use the cache.
+- **Kafka messages are returned as JSON, as stored.** They aren't checked against their Avro
+  schema or encoded; `include_schemas` returns the schemas for the caller to do that.
 - **A new snapshot is noticed after `MOCKS_CACHE_TTL` seconds** (default 300). Restart the
   server to see it at once.
 
@@ -402,7 +538,7 @@ notes but not read. Its format needs looking at first.
 | 1 | Network and access | The `curl` commands in [Check access](#3-check-access) | You see JSON with `children`. Otherwise, it's the network, TLS, or a token problem, not this code. |
 | 2 | Python install | `.venv/bin/python -c "import artifactory_mocks_mcp, mcp, httpx; print('ok')"` | It prints `ok` |
 | 3 | The server | The Inspector commands above, without `2>/dev/null` | JSON comes back. The log lines show each request and status. |
-| 4 | Your MCP client | Cursor Settings → MCP shows a green dot and 4 tools | If 3 works but this doesn't, check the path in `.cursor/mcp.json`, and Cursor's log under **View → Output** (choose the MCP log) |
+| 4 | Your MCP client | Cursor Settings → MCP shows a green dot and 5 tools | If 3 works but this doesn't, check the path in `.cursor/mcp.json`, and Cursor's log under **View → Output** (choose the MCP log) |
 | 5 | The answer | Read `notes`, `artifacts` and `components_searched` | See below |
 
 ### Corporate network
@@ -427,6 +563,7 @@ notes but not read. Its format needs looking at first.
 | No match, but the stub exists | The path differs, e.g. a gateway prefix with only one fixed segment in common, or a regex that rejects the sample values | Compare with `get_mock_stubs`. Try a concrete path, or no `method`. |
 | Too many matches | A short path matches many stubs | Pass `method` and `component` |
 | `body_missing` | The stub's `bodyFileName` isn't in the zip | A problem in the mock itself; tell its owners |
+| `No Kafka mock for topic` | The topic's folder has another name, or it's in another system's component | The note lists the topic folders found. Try the folder name, or no `system`. |
 
 ### Error messages
 
@@ -458,6 +595,7 @@ src/artifactory_mocks_mcp/
   server.py       MCP tool definitions
   mocks.py        MockService: choose components and builds, cache, search, format results
   wiremock.py     Read mock zips and match paths against stubs (no I/O)
+  kafka.py        Read the Kafka records in a zip's kafka/ folder (no I/O)
   versions.py     Pick the most recently built snapshot (no I/O)
   client.py       Artifactory REST client (auth, retries, errors)
   config.py       Settings from the environment or .env

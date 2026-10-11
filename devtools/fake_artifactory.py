@@ -95,6 +95,86 @@ ADDRESS_STUBS = {
     ]
 }
 
+# Kafka mocks, in the real layout: one folder per topic, a record (key + value) per event with
+# the value alone in <event>_envelope.json, and the Avro schemas the records name.
+ADDRESS_TOPIC = "customer.addresses-event-v1"
+ADDRESS_TOPIC_DIR = "kafka/customer_addresses-event-v1"
+KEY_SCHEMA = {
+    "type": "record",
+    "name": "CustomerKey",
+    "namespace": "com.example.customer.key",
+    "fields": [{"name": "cgid", "type": "string"}],
+}
+METADATA_SCHEMA = {
+    "type": "record",
+    "name": "Metadata",
+    "fields": [
+        {"name": "type", "type": "string"},
+        {"name": "customerType", "type": ["null", "string"], "default": None},
+        {"name": "subject", "type": "string"},
+        {"name": "cgid", "type": ["null", "string"], "default": None},
+    ],
+}
+SUBJECT_SCHEMA = {
+    "type": "record",
+    "name": "Subject",
+    "fields": [
+        {"name": "addressId", "type": "string"},
+        {"name": "streetName", "type": ["null", "string"], "default": None},
+    ],
+}
+VALUE_SCHEMA = {
+    "type": "record",
+    "name": "AddressStateChangeEvent",
+    "namespace": "com.example.customer.value.addresses",
+    "fields": [
+        {"name": "metadata", "type": METADATA_SCHEMA},
+        {"name": "subject", "type": ["null", SUBJECT_SCHEMA], "default": None},
+        {"name": "previousSubject", "type": ["null", "Subject"], "default": None},
+    ],
+}
+
+
+def address_event(event_type: str, customer_type: str, subject: object, previous: object) -> dict:
+    return {
+        "metadata": {
+            "eventVersion": "1.0",
+            "type": event_type,
+            "customerType": customer_type,
+            "subject": ADDRESS_TOPIC,
+            "id": "EVT-1",
+            "time": 1894752000000,
+            "cgid": "C1000001",
+        },
+        "subject": subject,
+        "previousSubject": previous,
+    }
+
+
+def kafka_record(value: dict) -> dict:
+    return {
+        "value": {"type": "avro", "schema": {"file": "valueSchema.avsc"}, "value": value},
+        "key": {"type": "avro", "schema": {"file": "keySchema.avsc"}, "value": {"cgid": "C1000001"}},
+    }
+
+
+DELETE_EVENT = address_event("DeleteAddress", "IND", None, {"addressId": "A1", "streetName": "Example Street"})
+UPDATE_EVENT_ORG = address_event(
+    "UpdateAddress", "ORG", {"addressId": "A2", "streetName": "New Street"}, {"addressId": "A2", "streetName": None}
+)
+KAFKA_FILES = {
+    f"{ADDRESS_TOPIC_DIR}/address_delete_event.json": json.dumps(kafka_record(DELETE_EVENT), indent=2),
+    f"{ADDRESS_TOPIC_DIR}/address_delete_event_envelope.json": json.dumps(DELETE_EVENT, indent=2),
+    f"{ADDRESS_TOPIC_DIR}/address_update_event_org.json": json.dumps(kafka_record(UPDATE_EVENT_ORG), indent=2),
+    f"{ADDRESS_TOPIC_DIR}/address_update_event_org_envelope.json": json.dumps(UPDATE_EVENT_ORG, indent=2),
+    f"{ADDRESS_TOPIC_DIR}/keySchema.avsc": json.dumps(KEY_SCHEMA, indent=2),
+    f"{ADDRESS_TOPIC_DIR}/valueSchema.avsc": json.dumps(VALUE_SCHEMA, indent=2),
+    # A second topic: a plain string key, and no schema files.
+    "kafka/customer_status-event-v1/status_changed_event.json": json.dumps(
+        {"key": {"type": "string", "value": "C1000001"}, "value": {"type": "json", "value": {"status": "ACTIVE"}}}
+    ),
+}
+
 ADDRESSES_CURRENT = make_zip(
     {
         "mock.properties": "org=CM\nurl=git@ghes.example.com:CM/cm-addresses.git\n",
@@ -106,7 +186,7 @@ ADDRESSES_CURRENT = make_zip(
             '{"customerId": "{{request.path.cgid}}", "addressId": "{{request.path.addressId}}", "status": "UPDATED"}'
         ),
         "__files/SOR/Addresses/addressesV2Response.json": json.dumps({"addresses": [], "version": 2}),
-        "kafka/addresses-audit.json": json.dumps({"topic": "addresses-audit", "message": {}}),
+        **KAFKA_FILES,
     }
 )
 

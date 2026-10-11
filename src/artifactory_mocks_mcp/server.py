@@ -59,6 +59,39 @@ async def find_mock(
 
 
 @mcp.tool()
+async def find_kafka_mock(
+    topic: str,
+    event_type: str | None = None,
+    system: str | None = None,
+    component: str | None = None,
+    include_schemas: bool = False,
+    max_events: int = 20,
+) -> dict[str, Any]:
+    """Find the Kafka message mocks for a topic: each event's key and value, from the kafka/
+    folder of the mock zips.
+
+    topic: the topic name, e.g. customer.addresses-event-v1. The folder form
+    (customer_addresses-event-v1) works too.
+    event_type: only this event, by its metadata.type (DeleteAddress) or file name
+    (address_delete_event). Omit to get every event on the topic.
+    system, component: as in find_mock.
+    include_schemas: also return the Avro schemas (.avsc) the events name.
+
+    For each component, the most recently built -SNAPSHOT version is used. Each event has its
+    file, event_type, customer_type, and key and value (format, schema_file and the value
+    itself). Read 'notes' for the topics and events that do exist when nothing matches.
+    """
+    return await _get_service().find_kafka(
+        topic,
+        event_type=event_type,
+        system=system,
+        component=component,
+        include_schemas=include_schemas,
+        max_events=max(1, min(max_events, 100)),
+    )
+
+
+@mcp.tool()
 async def list_mock_components(system: str | None = None, with_builds: bool = False) -> dict[str, Any]:
     """List the configured systems and their mock component folders in Artifactory.
 
@@ -75,7 +108,7 @@ async def get_mock_stubs(
     include_bodies: bool = False,
     max_stubs: int = 200,
 ) -> dict[str, Any]:
-    """List every stub in a mock component, e.g. cm-addresses.
+    """List every stub in a mock component, e.g. cm-addresses, and its Kafka topics.
 
     version: a folder name such as 1.3.1-SNAPSHOT (its newest build) or 1.2.0-484a3fa.
     Default: the most recently built -SNAPSHOT version. include_bodies adds response bodies.
@@ -87,8 +120,9 @@ async def get_mock_stubs(
 
 @mcp.tool()
 async def get_mock_file(component: str, file_path: str, version: str | None = None) -> dict[str, Any]:
-    """Read one file from a mock component's zip: a mapping file, mock.properties, or a response
-    body (a stub's bodyFileName works as is). version works as in get_mock_stubs.
+    """Read one file from a mock component's zip: a mapping file, mock.properties, a response
+    body (a stub's bodyFileName works as is), or a Kafka file such as an .avsc schema.
+    version works as in get_mock_stubs.
     """
     return await _get_service().file(component, file_path, version=version)
 

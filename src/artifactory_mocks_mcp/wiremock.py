@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+from .kafka import read_kafka
+
 MAX_UNCOMPRESSED_BYTES = 300 * 1024 * 1024
 
 # WireMock's URL matchers, most specific first. A stub uses at most one of them.
@@ -126,6 +128,7 @@ class MockArchive:
             if name.startswith("mappings/") and name.lower().endswith(".json"):
                 self._load_mappings(name)
         self.properties = _parse_properties(self.files.get("mock.properties", b""))
+        self.kafka_events, self.kafka_errors = read_kafka(self.files)
 
     @classmethod
     def from_zip(cls, data: bytes) -> "MockArchive":
@@ -161,9 +164,6 @@ class MockArchive:
     def body_file(self, body_file_name: str) -> bytes | None:
         """A response body referenced by bodyFileName, which is relative to __files/."""
         return self.files.get(posixpath.normpath(posixpath.join("__files", body_file_name.lstrip("/"))))
-
-    def has_kafka(self) -> bool:
-        return any(name.startswith("kafka/") for name in self.files)
 
 
 # ---- matching ----------------------------------------------------------------------
